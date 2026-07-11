@@ -1,60 +1,96 @@
 # Linear → Google Calendar Sync
 
-Linear 이슈의 due date를 Google Calendar 이벤트로 자동 동기화하는 Vercel 서버리스 함수.
+Linear 이슈에 due date를 지정하면 DDD Web2팀 Google Calendar에 이벤트가 자동으로 생성/갱신/삭제되는 단방향 동기화 시스템.
 
-## 동작 방식
+## 아키텍처
 
-1. Linear webhook이 `/api/webhook`으로 POST
-2. `linear-signature` 헤더를 HMAC-SHA256으로 검증
-3. `Issue` 이벤트일 때 action / dueDate 존재 여부로 분기
-   - dueDate 있음 + 이벤트 없음 → 생성
-   - dueDate 있음 + 이벤트 있음 → 갱신 (title/description/date 반영)
-   - dueDate 없음 + 이벤트 있음 → 삭제
-   - `remove` action → 삭제
-4. Google Calendar 이벤트의 `extendedProperties.private.linearIssueId`로 이슈-이벤트 매핑 유지 (별도 DB 불필요)
-
-## 로컬 개발
-
-```bash
-pnpm install
-cp .env.local.example .env.local
-# .env.local 값 채우기
-pnpm dev
+```
+┌──────────────────┐
+│   Linear Issue   │
+│  (dueDate 변경)  │
+└────────┬─────────┘
+         │ webhook (HTTPS POST + HMAC 서명)
+         ▼
+┌──────────────────────────────────────────┐
+│   Vercel Serverless Function             │
+│   POST /api/webhook                      │
+│                                          │
+│   1. linear-signature 헤더 검증          │
+│   2. Issue 이벤트 & action 판별          │
+│   3. dueDate 존재 여부 확인              │
+│   4. Google Calendar API 호출            │
+└────────┬─────────────────────────────────┘
+         │ OAuth2 (refresh token)
+         ▼
+┌──────────────────────────┐
+│  DDD Web2팀              │
+│  Google Calendar         │
+│                          │
+│  이벤트 매핑 저장:       │
+│  extendedProperties      │
+│    .private              │
+│    .linearIssueId        │
+└──────────────────────────┘
 ```
 
-로컬 포트를 외부 노출 (ngrok 등)한 뒤 Linear webhook URL로 등록하면 실제 이벤트 확인 가능.
+별도 DB 없이 Google Calendar 이벤트의 `extendedProperties.private.linearIssueId` 필드에 Linear 이슈 ID를 저장. 동일 이슈 webhook이 다시 오면 이 필드로 기존 이벤트를 조회 → 있으면 갱신, 없으면 생성.
 
-## 배포
+## 워크플로우
 
-1. GitHub 리포에 푸시
-2. Vercel에서 Import Project → 자동 배포
-3. Vercel Settings > Environment Variables에 아래 값 등록
-4. Linear Settings > API > Webhooks에서 URL을 `https://<project>.vercel.app/api/webhook`으로 설정, `Issue` 이벤트 구독
+### Linear 이슈 상태에 따른 캘린더 동작
 
-## 환경변수
+| Linear 이벤트 | dueDate | 기존 캘린더 이벤트 | 캘린더 동작 |
+|---|---|---|---|
+| 이슈 생성 | 있음 | - | **이벤트 생성** |
+| 이슈 수정 | 있음 | 없음 | **이벤트 생성** |
+| 이슈 수정 | 있음 | 있음 | **이벤트 갱신** (제목·날짜·내용) |
+| 이슈 수정 | 없음 (제거) | 있음 | **이벤트 삭제** |
+| 이슈 수정 | 없음 | 없음 | 무시 |
+| 이슈 삭제 | - | 있음 | **이벤트 삭제** |
+| 이슈 삭제 | - | 없음 | 무시 |
 
-| 이름 | 설명 |
+### 처리 흐름
+
+```
+Linear 이슈 변경
+     │
+     ▼
+[1] webhook 수신 (POST /api/webhook)
+     │
+     ▼
+[2] HMAC-SHA256으로 서명 검증
+     │ (실패 시 400 반환)
+     ▼
+[3] payload.type이 "Issue"인지 확인
+     │
+     ▼
+[4] action 분기
+     │
+     ├─ "remove"  → 기존 이벤트 조회 → 있으면 삭제
+     │
+     └─ "create" / "update"
+             │
+             ▼
+        dueDate 존재?
+             │
+        ┌────┴────┐
+        │         │
+        아니오    예
+        │         │
+        ▼         ▼
+   기존 이벤트  기존 이벤트
+   있으면 삭제   있으면 갱신
+                없으면 생성
+     │
+     ▼
+[5] Google Calendar API 호출 결과 반환
+```
+
+### 이슈 → 캘린더 이벤트 매핑
+
+| 캘린더 필드 | Linear 이슈에서 채우는 값 |
 |---|---|
-| `LINEAR_WEBHOOK_SECRET` | Linear webhook 생성 시 발급되는 signing secret |
-| `GOOGLE_CLIENT_ID` | Google Cloud OAuth 2.0 Client ID |
-| `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth 2.0 Client Secret |
-| `GOOGLE_REFRESH_TOKEN` | `calendar.events` scope로 발급받은 refresh token |
-| `GOOGLE_CALENDAR_ID` | 대상 캘린더 ID (`xxx@group.calendar.google.com`) |
-
-## 파일 구조
-
-```
-api/webhook.js          # POST /api/webhook 엔드포인트
-lib/verify-signature.js # HMAC-SHA256 검증
-lib/gcal-client.js      # Google Calendar 클라이언트 (OAuth2 + refresh token)
-lib/event-mapper.js     # Linear issue → GCal event body 매핑
-lib/handler.js          # action/dueDate 분기 로직 (create/update/delete)
-```
-
-## End-to-End 검증 체크리스트
-
-- [ ] Linear에서 due date 있는 이슈 생성 → 캘린더에 이벤트 뜨는지
-- [ ] due date 변경 → 이벤트 이동
-- [ ] title 변경 → 이벤트 summary 갱신
-- [ ] due date 제거 → 이벤트 삭제
-- [ ] 이슈 삭제(`remove`) → 이벤트 삭제
+| 제목 (summary) | `[DDD-42] 이슈 제목` |
+| 설명 (description) | 이슈 URL / State / Assignee / Priority |
+| 시작·종료 날짜 | `dueDate` (all-day 이벤트) |
+| 매핑 키 | `extendedProperties.private.linearIssueId` |
